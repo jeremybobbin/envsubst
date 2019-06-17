@@ -5,8 +5,6 @@ use std::{
         Write,
         BufWriter,
         BufReader,
-        stdin,
-        stdout
     },
     error::Error,
 };
@@ -17,23 +15,40 @@ use peek_while::*;
 pub fn env_subst<W: Write, R: Read>(reader: R, writer: W) -> Result<usize, Box<dyn Error>> {
     let mut written: usize = 0;
 
+    let mut is_escaped: bool = false;
+
     let mut writer = BufWriter::new(writer);
     let mut bytes = BufReader::new(reader)
         .bytes()
         .filter_map(Result::ok)
         .peekable();
 
-    while let Some(byte) = bytes.next() {
-        if byte == b'$' {
-            let key: String = bytes.by_ref()
-                .peek_while(|&b| b.is_ascii_alphanumeric() || b == b'_')
-                .map(|c| c as char)
-                .collect();
+    loop {
+        match bytes.next() {
+            Some(byte) if is_escaped => {
+                written += writer.write(&[byte])?;
+                is_escaped = false;
+            },
+            Some(b'$') => {
+                let bytes = bytes.by_ref();
 
-            written += writer.write(env::var(key)?.as_bytes())?;
-        } else {
-            written += writer.write(&[byte])?;
-        }
+                let iter: Box<dyn Iterator<Item=u8>> = if let Some(b'{') = bytes.peek() {
+                    bytes.next();
+                    Box::new(bytes.take_while(|&b: &u8| b != b'}'))
+                } else {
+                    Box::new(bytes.peek_while(|&b: &u8|  b.is_ascii_alphanumeric() || b == b'_'))
+                };
+
+                let key: String = iter
+                    .map(|c| c as char)
+                    .collect();
+
+                written += writer.write(env::var(key)?.as_bytes())?;
+            },
+            Some(b'\\') => is_escaped = true,
+            Some(byte) => written += writer.write(&[byte])?,
+            None => break
+        };
     }
     Ok(written)
 }
@@ -52,18 +67,49 @@ mod tests {
         }
     };
 
-    #[test]
-    fn it_works() {
-        let reader: Vec<u8> = "Blee blah $HOME eeell".into();
+    fn feed(input: &str, expected: &str) {
+        let reader = Cursor::new(input);
         let mut writer: Vec<u8> = Vec::new();
 
-        let home = env::var("HOME").unwrap();
-        let expected: Vec<u8> =  format!("Blee blah {} eeell", home).into();
-        
-        env_subst(&reader[..], &mut writer);
-        
-        let output = writer; 
+        env_subst(reader, &mut writer);
 
+        let output = String::from_utf8_lossy(&writer[..]);
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn it_works() {
+        let input = "Blee blah $HOME eeell";
+
+        let home = env::var("HOME").unwrap();
+        let expected =  format!("Blee blah {} eeell", home);
+
+        feed(input, &expected[..]);
+    }
+
+
+    #[test]
+    fn curly_braces() {
+        let input = "${HOME}";
+        let expected = env::var("HOME").unwrap();
+        feed(input, &expected[..]);
+    }
+
+    #[test]
+    fn escapes() {
+        let input = "\\$HOME";
+        let expected =  "$HOME";
+
+        feed(input, expected);
+    }
+
+    #[test]
+    fn big_test() {
+        let input = "\\$HOME $HOME ${HOME}";
+
+        let home = env::var("HOME").unwrap();
+        let expected =  format!("$HOME {} {}", home, home);
+
+        feed(input, &expected[..]);
     }
 }
